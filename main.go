@@ -1,63 +1,98 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
-	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
+// dnsServers 存储用户通过 -dns 提供的 DNS 服务器地址（格式：IP:端口或udp://IP:端口）
+type dnsServers []string
+
+func (d *dnsServers) String() string {
+	return fmt.Sprint(*d)
+}
+
+func (d *dnsServers) Set(value string) error {
+	*d = append(*d, value)
+	return nil
+}
+
 // resolveHost 解析主机名到 IP 地址
-// 优先使用 Go 内置解析，失败时调用系统 ping 命令获取 IP
-func resolveHost(host string) (string, error) {
-	// 如果已经是 IP 地址，直接返回
+// 如果自定义了 DNS 服务器，则直接使用它们进行解析；
+// 否则先尝试标准解析，失败后使用默认 DNS 8.8.8.8:53
+func resolveHost(host string, dnsList []string) (string, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return host, nil
 	}
 
-	// 尝试 Go 内置 DNS 解析
+	// 如果用户指定了 DNS 服务器，则使用它们
+	if len(dnsList) > 0 {
+		return resolveWithCustomDNS(host, dnsList)
+	}
+
+	// 未指定时，先尝试标准解析
 	ips, err := net.LookupHost(host)
 	if err == nil && len(ips) > 0 {
 		return ips[0], nil
 	}
 
-	// 内置解析失败，使用 ping 命令解析
-	fmt.Printf("内置 DNS 解析失败，尝试用 ping 解析 %s ...\n", host)
-	return resolveViaPing(host)
+	// 标准解析失败，使用默认 DNS 8.8.8.8:53
+	fmt.Printf("标准 DNS 解析失败，使用默认 DNS (8.8.8.8:53) 解析 %s ...\n", host)
+	return resolveWithCustomDNS(host, []string{"8.8.8.8:53"})
 }
 
-// resolveViaPing 通过 ping 命令提取域名对应的 IP
-func resolveViaPing(host string) (string, error) {
-	out, err := exec.Command("ping", "-c", "1", host).Output()
-	if err != nil {
-		return "", fmt.Errorf("ping 命令执行失败: %v", err)
+// resolveWithCustomDNS 使用自定义 DNS 服务器列表进行解析（纯 Go 实现，无需系统命令）
+func resolveWithCustomDNS(host string, dnsList []string) (string, error) {
+	// 逐个尝试 DNS 服务器
+	for _, server := range dnsList {
+		// 支持 udp:// 前缀，也支持直接 IP:端口
+		address := server
+		network := "udp"
+		if strings.Contains(server, "://") {
+			u, err := url.Parse(server)
+			if err != nil {
+				fmt.Printf("DNS 地址格式错误: %s，跳过\n", server)
+				continue
+			}
+			network = u.Scheme // 通常为 udp
+			address = u.Host
+		}
+
+		resolver := &net.Resolver{
+			PreferGo: true, // 使用 Go 实现的 DNS 客户端
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 5 * time.Second}
+				return d.DialContext(ctx, network, address)
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ips, err := resolver.LookupHost(ctx, host)
+		cancel()
+		if err == nil && len(ips) > 0 {
+			if len(dnsList) > 1 {
+				fmt.Printf("通过 DNS %s 解析成功\n", address)
+			}
+			return ips[0], nil
+		}
+		fmt.Printf("DNS %s 解析失败: %v\n", address, err)
 	}
-
-	output := string(out)
-
-	// 匹配 "PING baidu.com (124.237.177.164)" 格式
-	re := regexp.MustCompile(`PING\s+\S+\s+\(([0-9.]+)\)`)
-	matches := re.FindStringSubmatch(output)
-	if len(matches) > 1 {
-		return matches[1], nil
-	}
-
-	// 如果上面没匹配，可能 ping 直接给了 IP（如 "PING 124.237.177.164"）
-	re2 := regexp.MustCompile(`PING\s+([0-9.]+)`)
-	matches2 := re2.FindStringSubmatch(output)
-	if len(matches2) > 1 {
-		return matches2[1], nil
-	}
-
-	return "", fmt.Errorf("无法从 ping 输出中提取 IP:\n%s", output)
+	return "", fmt.Errorf("所有 DNS 服务器均解析失败")
 }
 
 func main() {
+	// 自定义 -dns 参数，可多次指定，格式: -dns 8.8.8.8:53 -dns 114.114.114.114:53
+	var customDNS dnsServers
+	flag.Var(&customDNS, "dns", "自定义 DNS 服务器，格式: IP:端口 或 udp://IP:端口 (可多次使用)")
+
 	count := flag.Int("c", 0, "发送次数（0 表示无限）")
 	interval := flag.Duration("i", time.Second, "间隔时间（如 1s, 500ms）")
 	timeout := flag.Duration("t", time.Second, "连接超时（如 2s）")
@@ -65,21 +100,21 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 2 {
-		fmt.Println("用法: tcpping <目标地址> <端口> [-c 次数] [-i 间隔] [-t 超时]")
-		fmt.Println("示例: tcpping 10.0.0.1 80 -c 4")
+		fmt.Println("用法: tcpping <目标地址> <端口> [-c 次数] [-i 间隔] [-t 超时] [-dns DNS服务器]")
+		fmt.Println("示例: tcpping baidu.com 80 -c 4 -dns 8.8.8.8:53")
 		os.Exit(1)
 	}
 	host := args[0]
 	port := args[1]
 
-	// 检查端口是否是数字
+	// 检查端口是否为数字
 	if _, err := fmt.Sscanf(port, "%d", new(int)); err != nil {
 		fmt.Printf("错误：端口必须为数字，得到 %q\n", port)
 		os.Exit(1)
 	}
 
 	// 解析主机
-	ip, err := resolveHost(host)
+	ip, err := resolveHost(host, customDNS)
 	if err != nil {
 		fmt.Printf("解析主机 %s 失败: %v\n", host, err)
 		os.Exit(1)
