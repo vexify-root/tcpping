@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -88,6 +89,53 @@ func resolveWithCustomDNS(host string, dnsList []string) (string, error) {
 	return "", fmt.Errorf("所有 DNS 服务器均解析失败")
 }
 
+// percentile 返回已排序切片中第 p 百分位的值（线性插值法）
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 100 {
+		return sorted[len(sorted)-1]
+	}
+	rank := (p / 100) * float64(len(sorted)-1)
+	lower := int(math.Floor(rank))
+	upper := int(math.Ceil(rank))
+	if lower == upper {
+		return sorted[lower]
+	}
+	frac := rank - float64(lower)
+	return sorted[lower]*(1-frac) + sorted[upper]*frac
+}
+
+// stddev 返回样本标准差（与 ping 的 mdev 计算方式一致）
+func stddev(values []float64, mean float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var sumSq float64
+	for _, v := range values {
+		d := v - mean
+		sumSq += d * d
+	}
+	return math.Sqrt(sumSq / float64(len(values)))
+}
+
+// jitter 返回 RFC 3550 中定义的 RTP 抖动值：
+// 相邻样本差的绝对值经过低通滤波后的平均值，等价于相邻往返时间差的平均绝对偏差。
+func jitter(values []float64) float64 {
+	if len(values) < 2 {
+		return 0
+	}
+	var sum float64
+	for i := 1; i < len(values); i++ {
+		sum += math.Abs(values[i] - values[i-1])
+	}
+	return sum / float64(len(values)-1)
+}
+
 func main() {
 	// 自定义 -dns 参数，可多次指定，格式: -dns 8.8.8.8:53 -dns 114.114.114.114:53
 	var customDNS dnsServers
@@ -96,12 +144,13 @@ func main() {
 	count := flag.Int("c", 0, "发送次数（0 表示无限）")
 	interval := flag.Duration("i", time.Second, "间隔时间（如 1s, 500ms）")
 	timeout := flag.Duration("t", time.Second, "连接超时（如 2s）")
+	warmup := flag.Int("w", 0, "预热次数（统计前丢弃的前若干次结果，避免冷启动影响）")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 2 {
-		fmt.Println("用法: tcpping <目标地址> <端口> [-c 次数] [-i 间隔] [-t 超时] [-dns DNS服务器]")
-		fmt.Println("示例: tcpping baidu.com 80 -c 4 -dns 8.8.8.8:53")
+		fmt.Println("用法: tcpping <目标地址> <端口> [-c 次数] [-i 间隔] [-t 超时] [-w 预热] [-dns DNS服务器]")
+		fmt.Println("示例: tcpping baidu.com 80 -c 10 -i 500ms -w 2 -dns 8.8.8.8:53")
 		os.Exit(1)
 	}
 	host := args[0]
@@ -127,8 +176,9 @@ func main() {
 	fmt.Printf("TCP Ping %s (端口 %s)\n", host, port)
 
 	var (
-		sent, received int
-		delays         []float64
+		sent, received, failed int
+		delays                []float64
+		totalStart            = time.Now()
 	)
 
 	sigCh := make(chan os.Signal, 1)
@@ -149,20 +199,35 @@ func main() {
 			}
 
 			sent++
+			seq := sent
 			start := time.Now()
 			conn, err := net.DialTimeout("tcp", target, *timeout)
 			elapsed := time.Since(start).Seconds() * 1000
 
+			// 预热阶段只做连接，不计入统计
+			if seq <= *warmup {
+				if err != nil {
+					fmt.Printf("[预热 %d/%d] 连接失败: %v (%.2f ms)\n", seq, *warmup, err, elapsed)
+				} else {
+					conn.Close()
+					fmt.Printf("[预热 %d/%d] %.2f ms\n", seq, *warmup, elapsed)
+				}
+				continue
+			}
+
 			if err != nil {
-				fmt.Printf("连接 %s 失败: %v (%.2f ms)\n", target, err, elapsed)
+				failed++
+				fmt.Printf("来自 %s 的回复: 失败 (%.2f ms) seq=%d %v\n", target, elapsed, seq, err)
 			} else {
 				conn.Close()
 				received++
 				delays = append(delays, elapsed)
-				fmt.Printf("来自 %s 的应答: 时间=%.2f ms\n", target, elapsed)
+				fmt.Printf("来自 %s 的回复: 时间=%.2f ms seq=%d\n", target, elapsed, seq)
 			}
 		}
 	}
+
+	totalElapsed := time.Since(totalStart)
 
 	// 统计
 	fmt.Println("\n--- TCP Ping 统计 ---")
@@ -170,17 +235,46 @@ func main() {
 		fmt.Println("未发送任何包。")
 		return
 	}
-	fmt.Printf("%d 个包已发送，%d 个包已接收，%.1f%% 丢包\n",
-		sent, received, float64(sent-received)/float64(sent)*100)
-	if len(delays) > 0 {
-		sort.Float64s(delays)
-		min := delays[0]
-		max := delays[len(delays)-1]
-		sum := 0.0
-		for _, d := range delays {
-			sum += d
-		}
-		avg := sum / float64(len(delays))
-		fmt.Printf("最小/平均/最大延迟 = %.2f/%.2f/%.2f ms\n", min, avg, max)
+	fmt.Printf("目标地址:        %s (端口 %s)\n", host, port)
+	if ip != host {
+		fmt.Printf("解析后 IP:       %s\n", ip)
 	}
+	fmt.Printf("总耗时:          %s\n", totalElapsed.Round(time.Millisecond))
+	fmt.Printf("已发送 / 已接收 / 失败:  %d / %d / %d\n", sent, received, failed)
+	if *warmup > 0 {
+		fmt.Printf("(其中预热 %d 次未计入统计)\n", *warmup)
+	}
+	if sent > 0 {
+		loss := float64(sent-received-failed) / float64(sent) * 100
+		if loss < 0 {
+			loss = 0
+		}
+		fmt.Printf("丢包率:          %.1f%%\n", loss)
+	}
+
+	if len(delays) == 0 {
+		return
+	}
+
+	sort.Float64s(delays)
+	min := delays[0]
+	max := delays[len(delays)-1]
+	var sum float64
+	for _, d := range delays {
+		sum += d
+	}
+	avg := sum / float64(len(delays))
+	sd := stddev(delays, avg)
+	jt := jitter(delays)
+	med := percentile(delays, 50)
+	p75 := percentile(delays, 75)
+	p90 := percentile(delays, 90)
+	p95 := percentile(delays, 95)
+	p99 := percentile(delays, 99)
+
+	fmt.Println("\n往返时间 (ms):")
+	fmt.Printf("  min / avg / max / stddev = %.2f / %.2f / %.2f / %.2f\n", min, avg, max, sd)
+	fmt.Printf("  median (P50) = %.2f\n", med)
+	fmt.Printf("  P75 / P90 / P95 / P99    = %.2f / %.2f / %.2f / %.2f\n", p75, p90, p95, p99)
+	fmt.Printf("  抖动 (Jitter)            = %.2f ms\n", jt)
 }
